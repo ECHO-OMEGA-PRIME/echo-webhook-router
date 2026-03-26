@@ -1,0 +1,83 @@
+name = "echo-webhook-router"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 for webhook log, route config, delivery tracking
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-webhook-router"
+database_id = "6084e759-02ed-4955-baf5-29d9911ce95e"
+
+# KV for route cache, signature keys, rate limits
+[[kv_namespaces]]
+binding = "CACHE"
+id = "0e4d001d478b4461b96aacc387a94361"
+
+# ── Target Worker Bindings ──────────────────────────────────────────────────
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "SWARM_BRAIN"
+service = "echo-swarm-brain"
+
+[[services]]
+binding = "X_BOT"
+service = "echo-x-bot"
+
+[[services]]
+binding = "LINKEDIN"
+service = "echo-linkedin"
+
+[[services]]
+binding = "TELEGRAM"
+service = "echo-telegram"
+
+[[services]]
+binding = "SLACK"
+service = "echo-slack"
+
+[[services]]
+binding = "REDDIT"
+service = "echo-reddit-bot"
+
+[[services]]
+binding = "INSTAGRAM"
+service = "echo-instagram"
+
+[[services]]
+binding = "WHATSAPP"
+service = "echo-whatsapp"
+
+[[services]]
+binding = "MESSENGER"
+service = "echo-messenger"
+
+[[services]]
+binding = "QA_TESTER"
+service = "echo-qa-tester"
+
+[[services]]
+binding = "ANALYTICS"
+service = "echo-analytics-pipeline"
+
+[[services]]
+binding = "FLEET_COMMANDER"
+service = "echo-fleet-commander"
+
+[[services]]
+binding = "DAEMON"
+service = "echo-autonomous-daemon"
+
+[[services]]
+binding = "BUILD_ORCHESTRATOR"
+service = "echo-build-orchestrator"
+
+# Cron triggers — cleanup + health
+[triggers]
+crons = [
+  "0 * * * *",       # Hourly: delivery retry for failed webhooks
+  "0 4 * * *",       # Daily 4am UTC: prune old logs
+]
