@@ -3,6 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+[[analytics_engine_datasets]]
+binding = "AE"
+dataset = "echo_metrics"
+
 # D1 for webhook log, route config, delivery tracking
 [[d1_databases]]
 binding = "DB"
