@@ -899,7 +899,8 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
   }
 
   // Health — no auth
-  if (path === '/health') {
+    if (path === '/') return json({ service: 'echo-webhook-router', status: 'operational' });
+if (path === '/health') {
     const pendingRetries = await env.DB.prepare(
       `SELECT COUNT(*) as count FROM failed_deliveries WHERE retry_count < max_retries`
     ).first<{ count: number }>();
