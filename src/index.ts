@@ -1,5 +1,5 @@
 /**
- * ECHO WEBHOOK ROUTER v1.0.0
+ * ECHO WEBHOOK ROUTER v1.1.0
  * Universal Inbound Event Hub for Echo Omega Prime
  *
  * Single entry point for ALL external webhooks. Verifies signatures,
@@ -306,10 +306,12 @@ async function verifyWebhook(source: string, request: Request, body: string, env
 // ── Default Route Registry ───────────────────────────────────────────────────
 
 const DEFAULT_ROUTES: WebhookRoute[] = [
-  // GitHub → multiple targets
-  { source: 'github', channel: 'push', targetBinding: 'BUILD_ORCHESTRATOR', targetPath: '/webhook/github', verifyMethod: 'hmac-sha256', headerName: 'x-hub-signature-256', active: true, description: 'GitHub push events to build orchestrator' },
-  { source: 'github', channel: 'push', targetBinding: 'SHARED_BRAIN', targetPath: '/webhook/github', verifyMethod: 'hmac-sha256', headerName: 'x-hub-signature-256', active: true, description: 'GitHub push events to shared brain' },
-  { source: 'github', channel: 'issues', targetBinding: 'DAEMON', targetPath: '/webhook/github', verifyMethod: 'hmac-sha256', active: true, description: 'GitHub issues to daemon' },
+  // GitHub → Shared Brain (ingest as context)
+  // Note: x-github-event header overrides URL channel, so push/issues/PR all work from same URL
+  { source: 'github', channel: 'push', targetBinding: 'SHARED_BRAIN', targetPath: '/ingest', verifyMethod: 'hmac-sha256', headerName: 'x-hub-signature-256', active: true, description: 'GitHub push events to shared brain' },
+  { source: 'github', channel: 'issues', targetBinding: 'SHARED_BRAIN', targetPath: '/ingest', verifyMethod: 'hmac-sha256', active: true, description: 'GitHub issues to shared brain' },
+  { source: 'github', channel: 'pull_request', targetBinding: 'SHARED_BRAIN', targetPath: '/ingest', verifyMethod: 'hmac-sha256', active: true, description: 'GitHub PRs to shared brain' },
+  { source: 'github', channel: 'ping', targetBinding: 'SHARED_BRAIN', targetPath: '/ingest', verifyMethod: 'hmac-sha256', active: true, description: 'GitHub ping (webhook registration confirmation)' },
 
   // Vercel → fleet + analytics
   { source: 'vercel', channel: 'deployment', targetBinding: 'FLEET_COMMANDER', targetPath: '/webhook/vercel', verifyMethod: 'hmac-sha1', active: true, description: 'Vercel deploys to fleet commander' },
@@ -414,6 +416,86 @@ function getBinding(env: Env, bindingName: string): Fetcher | null {
   return map[bindingName] || null;
 }
 
+// ── Payload Transformer ──────────────────────────────────────────────────────
+// Converts raw webhook payloads into the format the target endpoint expects.
+
+function transformForIngest(source: string, channel: string, rawBody: string, headers: Record<string, string>): string {
+  try {
+    const payload = JSON.parse(rawBody);
+    const event = headers['x-github-event'] || channel;
+
+    if (source === 'github') {
+      const repo = payload.repository?.full_name || 'unknown';
+      let content = '';
+      let importance = 3;
+      const tags = ['webhook', 'github', event];
+
+      if (event === 'push') {
+        const branch = (payload.ref || '').replace('refs/heads/', '');
+        const commits = payload.commits || [];
+        const commitMsgs = commits.map((c: Record<string, unknown>) => `- ${(c.message as string || '').split('\n')[0]}`).join('\n');
+        content = `[GitHub Push] ${repo} → ${branch} (${commits.length} commit${commits.length !== 1 ? 's' : ''})\n${commitMsgs}`;
+        importance = branch === 'main' ? 5 : 3;
+        tags.push(branch);
+      } else if (event === 'issues') {
+        const action = payload.action || 'unknown';
+        const title = payload.issue?.title || '';
+        content = `[GitHub Issue] ${repo} — ${action}: ${title}`;
+        importance = 4;
+      } else if (event === 'pull_request') {
+        const action = payload.action || 'unknown';
+        const title = payload.pull_request?.title || '';
+        content = `[GitHub PR] ${repo} — ${action}: ${title}`;
+        importance = 4;
+      } else if (event === 'ping') {
+        content = `[GitHub Ping] Webhook registered for ${repo}`;
+        importance = 2;
+      } else {
+        content = `[GitHub ${event}] ${repo} — ${JSON.stringify(payload).slice(0, 500)}`;
+      }
+
+      return JSON.stringify({ content, source: 'webhook-router', instance_id: 'webhook-router', importance, tags });
+    }
+
+    if (source === 'stripe') {
+      const type = payload.type || 'unknown';
+      const amount = payload.data?.object?.amount ? `$${(payload.data.object.amount / 100).toFixed(2)}` : '';
+      return JSON.stringify({
+        content: `[Stripe] ${type} ${amount}`.trim(),
+        source: 'webhook-router', instance_id: 'webhook-router',
+        importance: type.includes('succeeded') ? 7 : 4,
+        tags: ['webhook', 'stripe', 'revenue', type],
+      });
+    }
+
+    if (source === 'vercel') {
+      const name = payload.payload?.deployment?.name || payload.name || 'unknown';
+      const state = payload.payload?.deployment?.readyState || payload.type || 'unknown';
+      return JSON.stringify({
+        content: `[Vercel Deploy] ${name} → ${state}`,
+        source: 'webhook-router', instance_id: 'webhook-router',
+        importance: 4,
+        tags: ['webhook', 'vercel', 'deploy', name],
+      });
+    }
+
+    // Default: wrap raw payload
+    return JSON.stringify({
+      content: `[Webhook ${source}/${channel}] ${rawBody.slice(0, 1000)}`,
+      source: 'webhook-router', instance_id: 'webhook-router',
+      importance: 3,
+      tags: ['webhook', source, channel],
+    });
+  } catch {
+    return JSON.stringify({
+      content: `[Webhook ${source}/${channel}] ${rawBody.slice(0, 1000)}`,
+      source: 'webhook-router', instance_id: 'webhook-router',
+      importance: 3,
+      tags: ['webhook', source, channel],
+    });
+  }
+}
+
 async function deliverWebhook(
   env: Env,
   route: WebhookRoute,
@@ -438,11 +520,16 @@ async function deliverWebhook(
     };
   }
 
+  // Transform payload for /ingest endpoints (Shared Brain format)
+  const deliveryBody = route.targetPath === '/ingest'
+    ? transformForIngest(route.source, route.channel, body, headers)
+    : body;
+
   try {
     const resp = await binding.fetch(`https://worker${route.targetPath}`, {
       method: 'POST',
       headers: {
-        'Content-Type': headers['content-type'] || 'application/json',
+        'Content-Type': 'application/json',
         'X-Echo-API-Key': env.ECHO_API_KEY,
         'X-Webhook-Id': webhookId,
         'X-Webhook-Source': route.source,
@@ -452,7 +539,7 @@ async function deliverWebhook(
         ...(headers['x-github-delivery'] ? { 'X-GitHub-Delivery': headers['x-github-delivery'] } : {}),
         ...(headers['stripe-signature'] ? { 'Stripe-Signature': headers['stripe-signature'] } : {}),
       },
-      body,
+      body: deliveryBody,
     });
 
     const latency = Date.now() - start;
@@ -554,8 +641,11 @@ async function handleWebhook(
     bodyHash, body.length, ip, headers['user-agent'] || '', verified ? 1 : 0,
   ).run();
 
-  // Detect channel from payload if not specified
-  const resolvedChannel = channel || detectChannel(source, body, headers);
+  // Detect channel from payload/headers — for GitHub, always prefer x-github-event header
+  // because all events arrive at the same URL (/hook/github/push) but have different event types
+  const resolvedChannel = (source === 'github' && headers['x-github-event'])
+    ? headers['x-github-event']
+    : (channel || detectChannel(source, body, headers));
 
   // Get routes
   const routes = await getRoutes(env.DB, env.CACHE, source, resolvedChannel);
@@ -817,7 +907,7 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
     return json({
       status: 'ok',
       service: 'echo-webhook-router',
-      version: '1.0.0',
+      version: '1.1.0',
       timestamp: new Date().toISOString(),
       defaultRoutes: DEFAULT_ROUTES.length,
       pendingRetries: pendingRetries?.count || 0,
